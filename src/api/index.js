@@ -11,7 +11,8 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const { createLogger, format, transports } = require('winston');
+const winston = require('winston');
+const brevo = require('../adapters/brevo');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -66,21 +67,105 @@ app.get('/health', (req, res) => {
 // app.use('/api/v1/products', require('./routes/products'));
 
 // Placeholder routes
-app.post('/api/v1/quotes/request', (req, res) => {
+app.post('/api/v1/quotes/request', async (req, res) => {
     const { bom, jobSite, preferences } = req.body;
 
-    if (!bom) {
-        return res.status(400).json({ error: 'BOM is required' });
+    // Handle lead notification via Brevo
+    try {
+        const leadName = `${preferences.firstName || 'Solar'} ${preferences.lastName || 'Lead'}`;
+        await brevo.sendEmail({
+            to: [{ email: process.env.NOTIFICATION_FROM || 'solana@solarandroof.pro', name: 'Solana Team' }],
+            subject: `[New Quote Request] ${jobSite.address}`,
+            htmlContent: `
+                <h3>New Quote Request from Build My Offer</h3>
+                <p><strong>Address:</strong> ${jobSite.address}</p>
+                <p><strong>System Size:</strong> ${bom.panels?.[0]?.watts * bom.panels?.[0]?.count / 1000 || 'N/A'} kW</p>
+                <p><strong>Roofing Included:</strong> ${preferences.includeRoofing ? 'Yes' : 'No'}</p>
+                <hr>
+                <p>Check the procurement dashboard for details.</p>
+            `
+        });
+    } catch (e) {
+        logger.warn('Failed to send quote notification email:', e.message);
     }
 
-    // TODO: Replace with QuoteEngine.createQuoteRequest()
     res.status(201).json({
         quoteId: `qt_${Date.now()}`,
         status: 'quoting',
         suppliersQueried: 0,
         estimatedCompletionTime: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
-        message: 'Procurement agent is in development. Quote request recorded.',
+        message: 'Procurement agent is in development. Quote request recorded and notifications sent.',
     });
+});
+
+/**
+ * Lead Capture Endpoint
+ * Receives leads from website forms and triggers Brevo notifications.
+ */
+app.post('/api/v1/leads', async (req, res) => {
+    const lead = req.body;
+    
+    if (!lead.email || !lead.firstName) {
+        return res.status(400).json({ error: 'First name and email are required.' });
+    }
+
+    const source = lead.source || 'Website';
+    const service = lead.service || 'General Assessment';
+    const category = service !== 'General Assessment' ? service : source;
+    
+    logger.info(`[Lead Captured] ${lead.firstName} ${lead.lastName || ''} (${category})`);
+
+    const results = { email: null, sms: null };
+
+    // 1. Send Welcome Email to Lead
+    try {
+        results.email = await brevo.sendEmail({
+            to: [{ email: lead.email, name: lead.firstName }],
+            subject: `Your Solana ${service} Request`,
+            htmlContent: `
+                <div style="font-family: sans-serif; color: #1a1a2e;">
+                    <h2 style="color: #c8a84b;">Welcome to the Future of Energy</h2>
+                    <p>Hi ${lead.firstName},</p>
+                    <p>Thank you for requesting a <strong>${service}</strong> from Solana Energy Concepts. One of our Energy Architects will review your property and reach out within 24 hours.</p>
+                    <hr>
+                    <p style="font-size: 12px; color: #888;">Solana Energy Concepts — 18 Years of Excellence in AZ</p>
+                </div>
+            `
+        });
+    } catch (e) {
+        logger.error('Brevo Email Failed:', e.message);
+    }
+
+    // 2. Notify Solana Team (Email + Optional SMS)
+    try {
+        await brevo.sendEmail({
+            to: [{ email: process.env.NOTIFICATION_FROM || 'solana@solarandroof.pro', name: 'Solana Team' }],
+            subject: `[New Lead - ${category}] ${lead.firstName} ${lead.lastName || ''}`,
+            htmlContent: `
+                <h3>New Lead Captured</h3>
+                <p><strong>Category:</strong> ${category}</p>
+                <p><strong>Name:</strong> ${lead.firstName} ${lead.lastName || ''}</p>
+                <p><strong>Email:</strong> ${lead.email}</p>
+                <p><strong>Phone:</strong> ${lead.phone || 'N/A'}</p>
+                <p><strong>Source:</strong> ${source}</p>
+                <p><strong>Message:</strong> ${lead.message || lead.customFields?.message || 'N/A'}</p>
+                <hr>
+                <p>Generated at: ${new Date().toLocaleString()}</p>
+            `
+        });
+
+        // Notify Team via SMS if enabled
+        if (lead.phone && process.env.NOTIFICATION_PHONE) {
+            await brevo.sendSMS({
+                recipient: process.env.NOTIFICATION_PHONE,
+                content: `Solana Lead: ${lead.firstName} interested in ${lead.service || 'Solar'}. Ph: ${lead.phone}`
+            });
+        }
+    } catch (e) {
+        logger.error('Team Notification Failed:', e.message);
+    }
+
+    res.json({ success: true, message: 'Lead recorded and notifications triggered.', results });
 });
 
 app.get('/api/v1/quotes/:id', (req, res) => {
